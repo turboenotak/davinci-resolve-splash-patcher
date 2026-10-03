@@ -2,7 +2,7 @@
 DaVinci Resolve Splash Patcher
 ==============================
 
-Replaces the startup splash screens of DaVinci Resolve (Windows) with your own images.
+Replaces the startup splash screens of DaVinci Resolve (Windows and Linux) with your own images.
 
 How it works
 ------------
@@ -26,21 +26,29 @@ so "Restore" works and re-patching always starts from the pristine layout.
 
 Usage
 -----
-  pythonw splash_patcher.py            interface (opens in an Edge app window)
+  pythonw splash_patcher.py            interface (Windows: Edge app window)
+  python3 splash_patcher.py            interface (Linux: Chromium/Chrome/Edge app window, else browser tab)
   python  splash_patcher.py --apply    apply the saved configuration
   python  splash_patcher.py --auto     like --apply, but only if Resolve is not patched yet
-                                       (used by the scheduled task after updates)
+                                       (used by the scheduled task / systemd unit after updates)
   python  splash_patcher.py --restore  restore the original splash screens
+  python  splash_patcher.py --check    (read-only) show what was found in the Resolve binary
+  python  splash_patcher.py --find     (Linux) search /opt/resolve for the file holding the splash screens
+
+On Linux the target is the `resolve` ELF binary (default /opt/resolve/bin/resolve) and the
+settings live in ~/.config/ResolveSplashPatcher. Root is requested through pkexec/sudo only
+when the binary is not writable by the current user.
 """
 
 import ctypes
-import ctypes.wintypes as wt
+import functools
 import io
 import json
 import mmap
 import os
 import re
 import secrets
+import shlex
 import shutil
 import struct
 import subprocess
@@ -53,30 +61,74 @@ import uuid
 import zlib
 from dataclasses import dataclass, field
 
+IS_WIN = sys.platform == "win32"
+if IS_WIN:
+    import ctypes.wintypes as wt
+
 try:
     from PIL import Image, ImageOps
 except ImportError:  # pragma: no cover
-    ctypes.windll.user32.MessageBoxW(
-        None, "Pillow is not installed. Install it with:\n\npython -m pip install pillow\n\n"
-              "Не найден модуль Pillow. Установите его командой выше.",
-        "Resolve Splash Patcher", 0x10)
+    _msg = ("Pillow is not installed. Install it with:\n\npython -m pip install pillow\n\n"
+            "Не найден модуль Pillow. Установите его командой выше.")
+    if IS_WIN:
+        ctypes.windll.user32.MessageBoxW(None, _msg, "Resolve Splash Patcher", 0x10)
+    else:
+        print(_msg, file=sys.stderr)
     sys.exit(1)
 
 APP_NAME = "ResolveSplashPatcher"
-APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
-CONFIG_PATH = os.path.join(APP_DIR, "config.json")
-IMAGES_DIR = os.path.join(APP_DIR, "images")
-BACKUP_DIR = os.path.join(APP_DIR, "backups")
-LOG_PATH = os.path.join(APP_DIR, "patcher.log")
-DEFAULT_EXE = r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe"
+
+
+def _default_app_dir():
+    """Windows: %APPDATA%\\ResolveSplashPatcher. Linux: ~/.config/ResolveSplashPatcher, also when
+    the script runs as root through pkexec/sudo (then the invoking user's home is used)."""
+    if IS_WIN:
+        return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
+    home = None
+    if os.geteuid() == 0:
+        uid = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+        if uid:
+            try:
+                import pwd
+                home = pwd.getpwuid(int(uid)).pw_dir
+            except (KeyError, ValueError, ImportError):
+                home = None
+    if home:
+        return os.path.join(home, ".config", APP_NAME)
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, APP_NAME)
+
+
+def _set_app_dir(path):
+    global APP_DIR, CONFIG_PATH, IMAGES_DIR, BACKUP_DIR, LOG_PATH
+    APP_DIR = os.path.abspath(path)
+    CONFIG_PATH = os.path.join(APP_DIR, "config.json")
+    IMAGES_DIR = os.path.join(APP_DIR, "images")
+    BACKUP_DIR = os.path.join(APP_DIR, "backups")
+    LOG_PATH = os.path.join(APP_DIR, "patcher.log")
+
+
+_set_app_dir(_default_app_dir())
+if IS_WIN:
+    DEFAULT_EXE = r"C:\Program Files\Blackmagic Design\DaVinci Resolve\Resolve.exe"
+    TARGET_NAME = "Resolve.exe"
+else:
+    DEFAULT_EXE = "/opt/resolve/bin/resolve"
+    TARGET_NAME = "resolve"
+    # usual install locations of DaVinci Resolve on Linux (the installer defaults to /opt/resolve)
+    RESOLVE_DIRS = ("/opt/resolve", "/opt/resolve-studio", "/opt/DaVinciResolve",
+                    os.path.expanduser("~/resolve"), os.path.expanduser("~/DaVinciResolve"))
 TASK_NAME = "ResolveSplashPatcher"
+SERVICE_NAME = "resolve-splash-patcher"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 IMAGE_SIGS = (PNG_SIG, b"\xff\xd8\xff", b"GIF8", b"BM")
 MARKER = b"RSPATCH1"
 # resource set id -> name of its first splash entry (used as anchor to find the tables)
-GROUPS = (("1x", "ResolveSplashScreen1"), ("2x", "ResolveSplashScreen1@2x"))
+GROUPS = (("1x", ("ResolveSplashScreen1", "ResolveSplashScreen_Linux1")),
+          ("2x", ("ResolveSplashScreen1@2x", "ResolveSplashScreen_Linux1@2x")))
+MIRROR = "<mirror>"      # marker: a *_Linux node that simply shares the data of its Windows twin
 WIN_SLOT_RE = re.compile(r"^ResolveSplashScreen(\d+)(?:@2x)?$")
 LINUX_SLOT_RE = re.compile(r"^ResolveSplashScreen_Linux(\d+)(?:@2x)?$")
 # Colour and shape of the dark panel on the left of the stock splash screens (measured on
@@ -85,7 +137,7 @@ DARK_RGB = (24, 29, 37)
 DARK_ALPHA = 0.94
 DARK_SOLID, DARK_END = 0.30, 0.62
 
-CREATE_NO_WINDOW = 0x08000000
+CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
 
 
 def log(msg):
@@ -160,11 +212,26 @@ MESSAGES = {
     "waiting_admin": ("Waiting for administrator permission…", "Ожидание прав администратора…"),
     "op_failed": ("The operation failed (see patcher.log)", "Операция завершилась с ошибкой (см. patcher.log)"),
     "pick_exe": ("Choose Resolve.exe", "Выберите Resolve.exe"),
+    "no_dialog": ("No file dialog available. Install zenity (or python3-tk), or set \"exe\" in config.json.",
+                  "Нет диалога выбора файла. Установите zenity (или python3-tk) либо укажите \"exe\" в config.json."),
+    "no_elevation": ("Root permission is needed, but neither pkexec (graphical session) nor an interactive sudo "
+                     "is available. Run this in a terminal instead:\n{cmd}",
+                     "Нужны права root, но pkexec (графическая сессия) и интерактивный sudo недоступны. "
+                     "Выполните в терминале:\n{cmd}"),
+}
+# Linux wording (everything else only has \"Resolve.exe\" swapped for the file name of the target)
+LINUX_MESSAGES = {
+    "waiting_admin": ("Waiting for root permission…", "Ожидание прав root…"),
+    "uac_denied": ("Root permission was declined", "Запрос прав root отклонён"),
+    "uac_failed": ("Could not start the process as root", "Не удалось запустить процесс с правами root"),
 }
 
 
 def tr(key, **kw):
     en, ru = MESSAGES[key]
+    if not IS_WIN:
+        en, ru = LINUX_MESSAGES.get(key, (en, ru))
+        en, ru = en.replace("Resolve.exe", TARGET_NAME), ru.replace("Resolve.exe", TARGET_NAME)
     return (ru if LANG == "ru" else en).format(**kw)
 
 
@@ -220,6 +287,8 @@ class Layout:
     node_size: int
     node_count: int
     files: list = field(default_factory=list)
+    data_end: int = 0         # end of the data table (names offset when the data precedes the names)
+    scan_end: int = 0         # where to look for our marker (the table may extend past the last entry)
 
     def entry_start(self, node):
         return self.data + node.data_off
@@ -247,21 +316,23 @@ class Layout:
         return dict(sorted(out.items()))
 
     def win_slots(self):
-        return self._slots(WIN_SLOT_RE)
+        # a build that only ships the *_Linux names uses those as its primary slots
+        return self._slots(WIN_SLOT_RE) or self._slots(LINUX_SLOT_RE)
 
     def linux_slots(self):
-        return self._slots(LINUX_SLOT_RE)
+        return self._slots(LINUX_SLOT_RE) if self._slots(WIN_SLOT_RE) else {}
 
     def tree_range(self):
         return self.tree, self.tree + self.node_size * self.node_count
 
 
-def _walk_tree(buf, tree, node_size, limit=100000):
-    """Walk a Qt resource tree; returns list of (index, pos, name_off, flags, data_off|None)."""
+def _walk_tree(buf, tree, node_size, limit=3000000):
+    """Walk a Qt resource tree; returns list of (index, pos, name_off, flags, data_off|None).
+    Raises ValueError(reason) when the bytes at `tree` are not a plausible tree."""
     def raw(i):
         p = tree + node_size * i
         if p + node_size > len(buf):
-            raise ValueError
+            raise ValueError(f"node {i} lies beyond the end of the file")
         name_off, flags = struct.unpack(">IH", buf[p:p + 6])
         if flags & 2:
             count, first = struct.unpack(">II", buf[p + 6:p + 14])
@@ -273,15 +344,15 @@ def _walk_tree(buf, tree, node_size, limit=100000):
     while stack:
         i = stack.pop()
         if i in seen or i > limit:
-            raise ValueError
+            raise ValueError(f"node {i}: repeated or beyond limit")
         seen.add(i)
         p, name_off, flags, extra = raw(i)
         if flags & ~0x7:
-            raise ValueError
+            raise ValueError(f"node {i}: unknown flags 0x{flags:x}")
         if flags & 2:
             count, first = extra
-            if count == 0 or count > 10000 or first <= i or first + count > limit:
-                raise ValueError
+            if count == 0 or count > 1000000 or first <= i or first + count > limit:
+                raise ValueError(f"node {i}: bad directory (count={count}, first={first})")
             stack.extend(range(first, first + count))
             out.append((i, p, name_off, flags, None))
         else:
@@ -324,7 +395,74 @@ def _find_data_table(buf, names, files):
     raise PatchError(tr("no_data_table"))
 
 
-def locate(buf, group, anchor_name):
+_ROOT_RX = re.compile(rb"\x00\x00\x00\x00\x00\x02[\x00-\xff]{4}\x00\x00\x00\x01")
+MIN_SLOTS = 4          # a real splash resource lists at least this many slot names
+ADJACENT = 512         # max gap (alignment padding) between neighbouring tables
+
+
+def _tree_candidates(buf, names_end, entry):
+    """Offsets where a resource tree may start (root node: name 0, directory, first child 1).
+    Windows builds store data, names, tree (tree right after the names); the Linux build stores
+    tree, names, data (tree right before the names)."""
+    seen = set()
+    for tree in range(names_end, min(names_end + ADJACENT, len(buf) - 14)):
+        if struct.unpack(">IH", buf[tree:tree + 6]) == (0, 2) and \
+                struct.unpack(">I", buf[tree + 10:tree + 14])[0] == 1:
+            seen.add(tree)
+            yield tree
+    lo = max(0, entry - 32 * 1024 * 1024)
+    hits = [m.start() for m in _ROOT_RX.finditer(buf, lo, entry)]
+    for tree in reversed(hits):          # closest to the names first
+        if tree not in seen:
+            yield tree
+
+
+def _resolve_names(buf, names, nodes):
+    """Reads the name of every node. All of them must be readable (a few misses are allowed only
+    in big trees). Returns [Node] or None."""
+    named, bad = [], 0
+    for (i, pos, name_off, flags, data_off) in nodes:
+        if i == 0:
+            continue
+        r = read_name_entry(buf, names + name_off)
+        if not r:
+            bad += 1
+            continue
+        named.append(Node(i, pos, r[0], flags, data_off))
+    if bad > len(nodes) // 50:
+        return None
+    return named
+
+
+def _validate_data_after(buf, data, files):
+    """Data table that follows the names: every entry must fit before the next one and the
+    splash entries must hold images. Returns the end of the table or None."""
+    by_off = sorted({n.data_off: n for n in files}.values(), key=lambda n: n.data_off)
+    end = 0
+    for i, n in enumerate(by_off):
+        start = data + n.data_off
+        if start + 8 > len(buf):
+            return None
+        size = struct.unpack(">I", buf[start:start + 4])[0]
+        limit = data + by_off[i + 1].data_off if i + 1 < len(by_off) else len(buf)
+        if start + 4 + size > limit:
+            return None
+        if not n.flags & 5 and not bytes(buf[start + 4:start + 12]).startswith(IMAGE_SIGS):
+            if WIN_SLOT_RE.match(n.name) or LINUX_SLOT_RE.match(n.name):
+                return None
+        end = max(end, start + 4 + size)
+    return end
+
+
+def _find_data_after(buf, names_end, files):
+    for data in range(names_end, min(names_end + 256, len(buf))):
+        end = _validate_data_after(buf, data, files)
+        if end:
+            return data, end
+    return None
+
+
+def locate(buf, group, anchor_name, trace=lambda msg: None):
     """Locate the Qt resource containing `anchor_name`. Works on original and on
     previously patched executables (name and tree tables are never relocated)."""
     anchor = anchor_name.encode("utf-16-be")
@@ -345,44 +483,101 @@ def locate(buf, group, anchor_name):
                 break
             q += r[1]
         names_end = q
-        for node_size in (22, 14):
-            for tree in range(names_end, names_end + 512):
-                if struct.unpack(">IH", buf[tree:tree + 6]) != (0, 2):
-                    continue
-                if struct.unpack(">I", buf[tree + 10:tree + 14])[0] != 1:
-                    continue
+        trace(f"anchor {anchor_name} at 0x{entry:x}, name entries end at 0x{names_end:x}")
+        for tree in _tree_candidates(buf, names_end, entry):
+            for node_size in (22, 14):
                 try:
                     nodes = _walk_tree(buf, tree, node_size)
-                except (ValueError, struct.error):
+                except (ValueError, struct.error) as e:
+                    trace(f"  tree 0x{tree:x} size {node_size}: {e}")
                     continue
+                tree_end = tree + node_size * (max(n[0] for n in nodes) + 1)
                 for cand in (n for n in nodes if n[4] is not None):
                     names = entry - cand[2]
-                    if names < 0:
+                    if names < 0 or not read_name_entry(buf, names):
                         continue
-                    named, ok = [], True
-                    for (i, pos, name_off, flags, data_off) in nodes:
-                        if i == 0:
-                            continue
-                        r = read_name_entry(buf, names + name_off)
-                        if not r:
-                            ok = False
-                            break
-                        named.append(Node(i, pos, r[0], flags, data_off))
-                    if not ok or not any(n.name == anchor_name for n in named):
+                    tree_first = tree_end <= names
+                    gap = names - tree_end if tree_first else tree - names_end
+                    if not 0 <= gap < ADJACENT:
+                        continue
+                    named = _resolve_names(buf, names, nodes)
+                    if not named or not any(n.name == anchor_name for n in named):
                         continue
                     files = [n for n in named if n.data_off is not None]
-                    data = _find_data_table(buf, names, files)
+                    nslots = sum(1 for n in files
+                                 if WIN_SLOT_RE.match(n.name) or LINUX_SLOT_RE.match(n.name))
+                    if nslots < MIN_SLOTS:
+                        trace(f"  tree 0x{tree:x} size {node_size}: only {nslots} slot names")
+                        continue
+                    if tree_first:
+                        found = _find_data_after(buf, names_end, files)
+                        if not found:
+                            trace(f"  tree 0x{tree:x}: no data table after the names")
+                            continue
+                        data, data_end = found
+                    else:
+                        data = _find_data_table(buf, names, files)
+                        data_end = names
+                    trace(f"  OK: tree 0x{tree:x} (size {node_size}, {len(nodes)} nodes), names "
+                          f"0x{names:x}, data 0x{data:x}, order "
+                          f"{'tree-names-data' if tree_first else 'data-names-tree'}")
                     return Layout(group=group, tree=tree, names=names, data=data,
                                   node_size=node_size, node_count=max(n[0] for n in nodes) + 1,
-                                  files=files)
+                                  files=files, data_end=data_end,
+                                  scan_end=min(len(buf), data_end + (64 << 20)) if tree_first else 0)
+
+
+def diagnose(path):
+    """Read-only: explains step by step what the locator sees in the binary."""
+    print(f"File: {path}")
+    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        print(f"Size: {len(mm) / 1e6:.1f} MB")
+        for gid, anchors in GROUPS:
+            for anchor in anchors:
+                n = mm.count(anchor.encode("utf-16-be")) if hasattr(mm, "count") else "?"
+                print(f"\n[{gid}] {anchor}")
+                lay = locate(mm, gid, anchor, trace=lambda m: print("   ", m))
+                if lay:
+                    print(f"  -> found: {len(lay.win_slots())} primary / {len(lay.linux_slots())} "
+                          f"Linux slots, {len(lay.files)} files")
+        try:
+            lays = locate_all(mm)
+            print("\nlocate_all: OK")
+            for g, lay in lays.items():
+                node = next(iter(lay.win_slots().values()))
+                try:
+                    size = Image.open(io.BytesIO(lay.read(mm, node))).size
+                except Exception as e:      # noqa: BLE001
+                    size = f"unreadable ({e})"
+                print(f"  {g}: first slot {node.name} -> {size}")
+        except PatchError as e:
+            print(f"\nlocate_all: {e}")
+
+
+def _plausible_splash(buf, lay):
+    """Safety net: every primary slot must decode to a wide banner image. Never write into a table
+    that merely looks like a resource tree."""
+    slots = lay.win_slots()
+    if not slots:
+        return False
+    for node in slots.values():
+        try:
+            w, h = Image.open(io.BytesIO(lay.read(buf, node))).size
+        except Exception:      # noqa: BLE001
+            return False
+        if w < 600 or h < 250 or not 1.5 <= w / h <= 4:
+            return False
+    return True
 
 
 def locate_all(buf):
     out = {}
-    for gid, anchor in GROUPS:
-        lay = locate(buf, gid, anchor)
-        if lay and lay.win_slots():
-            out[gid] = lay
+    for gid, anchors in GROUPS:
+        for anchor in anchors:
+            lay = locate(buf, gid, anchor)
+            if lay and _plausible_splash(buf, lay):
+                out[gid] = lay
+                break
     if not out:
         raise PatchError(tr("no_resources"))
     return out
@@ -393,6 +588,8 @@ def locate_all(buf):
 # --------------------------------------------------------------------------------------
 
 def file_version(path):
+    if not IS_WIN:
+        return "unknown"        # ELF files carry no version resource; see exe_identity()
     try:
         ver = ctypes.windll.version
         size = ver.GetFileVersionInfoSizeW(path, None)
@@ -413,6 +610,30 @@ def backup_key(exe_path, version=None):
     return f"{version or file_version(exe_path)}_{os.path.getsize(exe_path)}"
 
 
+def exe_identity(path, mm, layouts, version=None):
+    """Returns (version, backup key). The key must be the same before and after patching.
+    Windows: file version + size. Linux has no version resource, so the key is the size plus a
+    hash of samples from the part of the file in front of the resource tables (never patched)."""
+    size = os.path.getsize(path)
+    version = version or file_version(path)
+    if IS_WIN:
+        return version, backup_key(path, version)
+    import hashlib
+    h = hashlib.sha1()
+    # Only bytes in front of every resource table are hashed: the patcher never touches them, so the
+    # key is the same before and after patching. 32 samples spread over that part of the file.
+    limit = min(min(lay.data, lay.tree, lay.names) for lay in layouts.values())
+    chunk = 32 * 1024
+    if limit <= 32 * chunk:
+        h.update(mm[:limit])
+    else:
+        step = (limit - chunk) // 31
+        for i in range(32):
+            h.update(mm[i * step:i * step + chunk])
+    digest = h.hexdigest()
+    return f"linux-{digest[:8]}", f"linux_{digest[:16]}_{size}"
+
+
 def backup_dir(key, group):
     # the 1x set lives in the root of the version folder (compatible with older backups)
     d = os.path.join(BACKUP_DIR, key)
@@ -420,6 +641,19 @@ def backup_dir(key, group):
 
 
 def resolve_running():
+    if not IS_WIN:
+        try:
+            pids = [d for d in os.listdir("/proc") if d.isdigit()]
+        except OSError:
+            return False
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/comm", encoding="utf-8", errors="replace") as f:
+                    if f.read().strip().lower() == "resolve":
+                        return True
+            except OSError:
+                continue
+        return False
     try:
         out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Resolve.exe", "/NH"],
                              capture_output=True, text=True, creationflags=CREATE_NO_WINDOW).stdout
@@ -429,21 +663,79 @@ def resolve_running():
 
 
 def is_admin():
+    if not IS_WIN:
+        return os.geteuid() == 0
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
 
 
-def find_marker(buf, layout):
-    p = buf.find(MARKER, layout.data, layout.names)
-    if p < 0:
-        return None
-    length = struct.unpack(">I", buf[p + 8:p + 12])[0]
+def needs_elevation(exe):
+    """Linux: root is only requested when the target file is not writable for us."""
+    return not IS_WIN and os.geteuid() != 0 and os.path.exists(exe) and not os.access(exe, os.W_OK)
+
+
+_SPLASH_NEEDLE = "ResolveSplashScreen1".encode("utf-16-be")
+
+
+def has_splash_resources(path):
     try:
-        return json.loads(bytes(buf[p + 12:p + 12 + length]).decode("utf-8"))
-    except Exception:
-        return {}
+        with open(path, "rb") as f:
+            if f.read(4) != b"\x7fELF" and not IS_WIN:
+                return False
+            if os.fstat(f.fileno()).st_size < 4096:
+                return False
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                return mm.find(_SPLASH_NEEDLE) >= 0
+    except (OSError, ValueError):
+        return False
+
+
+def find_resolve_binary():
+    """Linux: finds the file that embeds the splash screens. Normally bin/resolve; if that one
+    has none (the Qt resources can live in a shared library), every ELF file below the install
+    directory is searched."""
+    if IS_WIN:
+        return None
+    roots = [d for d in RESOLVE_DIRS if os.path.isdir(d)]
+    for r in roots:
+        main = os.path.join(r, "bin", "resolve")
+        if os.path.isfile(main) and has_splash_resources(main):
+            return main
+    for r in roots:
+        for dp, _dn, files in os.walk(r):
+            for name in sorted(files):
+                p = os.path.join(dp, name)
+                if os.path.islink(p) or not os.path.isfile(p):
+                    continue
+                if has_splash_resources(p):
+                    return p
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def guess_exe():
+    if IS_WIN:
+        return DEFAULT_EXE
+    if os.path.isfile(DEFAULT_EXE) and has_splash_resources(DEFAULT_EXE):
+        return DEFAULT_EXE
+    return find_resolve_binary() or DEFAULT_EXE
+
+
+def find_marker(buf, layout):
+    end = layout.scan_end or layout.data_end
+    p = buf.find(MARKER, layout.data, end)
+    while p >= 0:
+        length = struct.unpack(">I", buf[p + 8:p + 12])[0]
+        try:
+            meta = json.loads(bytes(buf[p + 12:p + 12 + length]).decode("utf-8"))
+        except Exception:
+            meta = {}
+        if not layout.scan_end or meta.get("group") == layout.group:
+            return meta
+        p = buf.find(MARKER, p + 1, end)      # a marker of another set: keep looking
+    return None
 
 
 @dataclass
@@ -472,7 +764,31 @@ def inspect_exe(path):
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
         layouts = locate_all(mm)
         markers = {g: find_marker(mm, lay) for g, lay in layouts.items()}
-    return ExeInfo(path, version, backup_key(path, version), layouts, markers)
+        version, key = exe_identity(path, mm, layouts, version)
+    return ExeInfo(path, version, key, layouts, markers)
+
+
+def print_check(path):
+    """Read-only diagnostics: what the patcher finds in the binary."""
+    info = inspect_exe(path)
+    print(f"File:    {path}")
+    print(f"Version: {info.version}   state: {info.state}   backup key: {info.key}")
+    for g, lay in info.layouts.items():
+        win, lin = lay.win_slots(), lay.linux_slots()
+        sizes = set()
+        with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            for n in list(win.values())[:1] + list(lin.values())[:1]:
+                try:
+                    sizes.add((n.name, Image.open(io.BytesIO(lay.read(mm, n))).size))
+                except Exception as e:      # noqa: BLE001
+                    sizes.add((n.name, f"unreadable: {e}"))
+            regions = _free_regions(mm, lay, [])
+        print(f"  set {g}: {len(win)} primary slots, {len(lin)} *_Linux slots, "
+              f"free space {sum(e - s for s, e in regions) / 1e6:.1f} MB, "
+              f"patched: {info.markers[g] is not None}")
+        for name, size in sorted(sizes):
+            print(f"    {name}: {size}")
+    return {"checked": True}
 
 
 # --------------------------------------------------------------------------------------
@@ -649,7 +965,7 @@ def encode_png(img, quantize=False):
 # --------------------------------------------------------------------------------------
 
 def default_config():
-    return {"exe": DEFAULT_EXE, "images": [], "slots": {}, "darken": True, "lang": "en"}
+    return {"exe": guess_exe(), "images": [], "slots": {}, "darken": True, "lang": "en"}
 
 
 def load_config():
@@ -749,7 +1065,49 @@ def _pack(blobs, regions):
     return placed
 
 
-def _write_group(fh, layout, assignment, regions, blobs, placed, meta):
+def _plan_linux(mm, layout, template, assignment, keep):
+    """Decides what the *_Linux nodes of a set point to. Returns (template, {slot: value}) where the
+    value is a blob key, MIRROR (share the Windows twin) or None (keep own original data; those
+    nodes are appended to `keep`). Windows keeps the old behaviour (Linux variants are never
+    shown there). On Linux the variants are the ones Resolve shows, so they get the user's images
+    too, rendered on their own template when its size/shape differs."""
+    win, lin = layout.win_slots(), layout.linux_slots()
+    first_used = next((i for i in assignment.values() if i is not None), None)
+    lin_tpl, separate = template, False
+    if lin and not IS_WIN:
+        try:
+            cand = Image.open(io.BytesIO(layout.read(mm, next(iter(lin.values()))))).convert("RGBA")
+            if cand.size != template.size or template_geometry(cand) != template_geometry(template):
+                lin_tpl, separate = cand, True
+        except Exception:      # noqa: BLE001 - unreadable original: fall back to the Windows template
+            pass
+    out = {}
+    for num, node in lin.items():
+        img = assignment.get(num, first_used)
+        if img is None:
+            if IS_WIN:
+                out[num] = MIRROR if num in win else None
+            else:
+                out[num] = None
+                keep.append(node)
+        else:
+            out[num] = img + ":L" if separate else img
+    return lin_tpl, out
+
+
+def _blob_templates(p):
+    """blob key -> template it is rendered on ('<image id>' or '<image id>:L' for Linux variants)."""
+    need = {}
+    for v in p["assignment"].values():
+        if v is not None:
+            need[v] = p["template"]
+    for v in p["lin_assign"].values():
+        if v is not None and v != MIRROR:
+            need[v] = p["lin_template"] if v.endswith(":L") else p["template"]
+    return need
+
+
+def _write_group(fh, layout, assignment, lin_assign, regions, blobs, placed, meta):
     win, lin = layout.win_slots(), layout.linux_slots()
     for s, e in regions:                      # no stale PNGs left behind
         fh.seek(s)
@@ -764,16 +1122,17 @@ def _write_group(fh, layout, assignment, regions, blobs, placed, meta):
         fh.seek(node.pos + 10)
         fh.write(struct.pack(">I", data_off))
 
-    first_used = next(i for i in assignment.values() if i is not None)
     for num, node in win.items():
         if assignment[num] is not None:
             point(node, 0, placed[assignment[num]] - layout.data)
     for num, node in lin.items():
-        # Linux variants are never shown on Windows; point them at the matching slot
-        if num in win and assignment[num] is None:
+        key = lin_assign[num]
+        if key is None:
+            continue                          # keeps its own original data
+        if key == MIRROR:                     # Windows: never shown there, share the twin's data
             point(node, win[num].flags, win[num].data_off)
         else:
-            point(node, 0, placed[assignment.get(num) or first_used] - layout.data)
+            point(node, 0, placed[key] - layout.data)
 
     rec = MARKER + struct.pack(">I", len(meta)) + meta
     used_end = {pos: pos + 4 + len(blobs[i]) for i, pos in placed.items()}
@@ -798,13 +1157,13 @@ def apply_patch(cfg, progress=lambda msg, frac=None: None):
     progress(tr("analyzing"), 0.02)
     version = file_version(exe)        # must be read before the file is opened for writing
     size = os.path.getsize(exe)
-    key = backup_key(exe, version)
 
     # 1. back up pristine sets, roll previously patched sets back to the original layout
     with open(exe, "r+b") as fh:
         with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
             layouts = locate_all(mm)
             markers = {g: find_marker(mm, lay) for g, lay in layouts.items()}
+            version, key = exe_identity(exe, mm, layouts, version)
             for g, lay in layouts.items():
                 if markers[g] is None:
                     create_backup(mm, lay, key, version, size)
@@ -829,7 +1188,9 @@ def apply_patch(cfg, progress=lambda msg, frac=None: None):
             template = Image.open(io.BytesIO(lay.read(mm, next(iter(win.values()))))).convert("RGBA")
             assignment = effective_slots(cfg, list(win))
             keep = [win[n] for n, v in assignment.items() if v is None]
+            lin_template, lin_assign = _plan_linux(mm, lay, template, assignment, keep)
             plan[g] = {"layout": lay, "template": template, "assignment": assignment,
+                       "lin_template": lin_template, "lin_assign": lin_assign,
                        "regions": _free_regions(mm, lay, keep)}
 
     images = {im["id"]: im for im in cfg["images"]}
@@ -847,11 +1208,12 @@ def apply_patch(cfg, progress=lambda msg, frac=None: None):
         for g, p in plan.items():
             step += 1
             progress(tr("preparing", name=im["name"], group=g), 0.08 + 0.72 * step / total_steps)
-            if img_id not in p["assignment"].values():
-                continue
-            out = render_splash(src, p["template"], im["fx"], im["fy"], im["zoom"], cfg.get("darken", True))
-            p.setdefault("rendered", {})[img_id] = out
-            p.setdefault("blobs", {})[img_id] = encode_png(out)
+            for key, tpl in _blob_templates(p).items():
+                if key.split(":")[0] != img_id:
+                    continue
+                out = render_splash(src, tpl, im["fx"], im["fy"], im["zoom"], cfg.get("darken", True))
+                p.setdefault("rendered", {})[key] = out
+                p.setdefault("blobs", {})[key] = encode_png(out)
 
     # 4. pack (quantise the heaviest images only if they don't fit)
     quantized = set()
@@ -862,7 +1224,7 @@ def apply_patch(cfg, progress=lambda msg, frac=None: None):
                     if (g, i) not in quantized]
             if not cand:
                 raise PatchError(tr("no_space"))
-            progress(tr("quantizing", name=images[cand[0]]["name"]), 0.82)
+            progress(tr("quantizing", name=images[cand[0].split(":")[0]]["name"]), 0.82)
             p["blobs"][cand[0]] = encode_png(p["rendered"][cand[0]], quantize=True)
             quantized.add((g, cand[0]))
             p["placed"] = _pack(p["blobs"], p["regions"])
@@ -874,7 +1236,8 @@ def apply_patch(cfg, progress=lambda msg, frac=None: None):
         for g, p in plan.items():
             meta = json.dumps({"tool": APP_NAME, "time": stamp, "version": version, "group": g,
                                "slots": {str(k): v for k, v in p["assignment"].items()}}).encode()
-            _write_group(fh, p["layout"], p["assignment"], p["regions"], p["blobs"], p["placed"], meta)
+            _write_group(fh, p["layout"], p["assignment"], p["lin_assign"], p["regions"], p["blobs"],
+                         p["placed"], meta)
 
     # 6. verify: every slot must decode to an image of the original size
     progress(tr("verifying"), 0.96)
@@ -888,6 +1251,16 @@ def apply_patch(cfg, progress=lambda msg, frac=None: None):
                 img.load()
                 if img.size != plan[g]["template"].size:
                     raise PatchError(tr("verify_slot", num=num, group=g))
+            if not IS_WIN:      # on Linux the *_Linux variants are the ones that get shown
+                for num, node in lay.linux_slots().items():
+                    try:
+                        img = Image.open(io.BytesIO(lay.read(mm, node)))
+                        img.load()
+                    except Exception:      # noqa: BLE001
+                        raise PatchError(tr("verify_slot", num=f"Linux {num}", group=g))
+                    if img.size != plan[g]["lin_template"].size:
+                        log(f"warning: Linux slot {num} ({g}) is {img.size}, expected "
+                            f"{plan[g]['lin_template'].size}")
 
     stats = {g: {"bytes": sum(len(b) for b in p["blobs"].values()),
                  "free": sum(e - s for s, e in p["regions"]), "size": list(p["template"].size)}
@@ -897,7 +1270,7 @@ def apply_patch(cfg, progress=lambda msg, frac=None: None):
         f", quantized={len(quantized)}")
     progress(tr("done"), 1.0)
     return {"images": len(used), "sets": stats,
-            "quantized": sorted({images[i]["name"] for _, i in quantized})}
+            "quantized": sorted({images[i.split(":")[0]]["name"] for _, i in quantized})}
 
 
 # --------------------------------------------------------------------------------------
@@ -906,17 +1279,93 @@ def apply_patch(cfg, progress=lambda msg, frac=None: None):
 
 def _python(windowless=True):
     exe = sys.executable
+    if not IS_WIN:
+        return exe
     cand = os.path.join(os.path.dirname(exe), "pythonw.exe" if windowless else "python.exe")
     return cand if os.path.isfile(cand) else exe
 
 
+_task_cache = (0.0, False)
+
+
+def _systemctl(*args, user):
+    cmd = ["systemctl", *(["--user"] if user else []), *args]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _unit_dir(user):
+    return os.path.expanduser("~/.config/systemd/user") if user else "/etc/systemd/system"
+
+
 def task_installed():
+    if not IS_WIN:
+        global _task_cache
+        if time.time() - _task_cache[0] < 5:
+            return _task_cache[1]
+        found = False
+        if shutil.which("systemctl"):
+            for user in (False, True):
+                try:
+                    found = found or _systemctl("is-enabled", f"{SERVICE_NAME}.path", user=user).returncode == 0
+                except OSError:
+                    pass
+        _task_cache = (time.time(), found)
+        return found
     r = subprocess.run(["schtasks", "/Query", "/TN", TASK_NAME], capture_output=True,
                        creationflags=CREATE_NO_WINDOW)
     return r.returncode == 0
 
 
+def _install_task_linux():
+    """A systemd .path unit watches the Resolve binary and starts `--auto` whenever it changes (an
+    update replaces it); the service is also enabled at boot. System units when the binary needs
+    root (this process then runs as root), user units otherwise."""
+    global _task_cache
+    if not shutil.which("systemctl"):
+        raise PatchError(tr("task_failed", err="systemctl not found (systemd required)"))
+    exe = load_config()["exe"]
+    user = os.geteuid() != 0
+    d = _unit_dir(user)
+    os.makedirs(d, exist_ok=True)
+    wanted = "default.target" if user else "multi-user.target"
+    service = f"""[Unit]
+Description=Re-apply custom DaVinci Resolve splash screens
+
+[Service]
+Type=oneshot
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart={shlex.quote(_python())} {shlex.quote(os.path.abspath(__file__))} --auto --data-dir {shlex.quote(APP_DIR)}
+TimeoutStartSec=15min
+
+[Install]
+WantedBy={wanted}
+"""
+    path_unit = f"""[Unit]
+Description=Watch DaVinci Resolve for updates (Resolve Splash Patcher)
+
+[Path]
+PathChanged={exe}
+Unit={SERVICE_NAME}.service
+
+[Install]
+WantedBy={wanted}
+"""
+    with open(os.path.join(d, f"{SERVICE_NAME}.service"), "w", encoding="utf-8") as f:
+        f.write(service)
+    with open(os.path.join(d, f"{SERVICE_NAME}.path"), "w", encoding="utf-8") as f:
+        f.write(path_unit)
+    for args in (("daemon-reload",), ("enable", f"{SERVICE_NAME}.service"),
+                 ("enable", "--now", f"{SERVICE_NAME}.path")):
+        r = _systemctl(*args, user=user)
+        if r.returncode != 0:
+            raise PatchError(tr("task_failed", err=(r.stderr or r.stdout).strip()))
+    _task_cache = (0.0, False)
+    return {"task": True}
+
+
 def install_task():
+    if not IS_WIN:
+        return _install_task_linux()
     user = os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")
     script = os.path.abspath(__file__)
     xml = f"""<?xml version="1.0" encoding="UTF-16"?>
@@ -954,6 +1403,18 @@ def install_task():
 
 
 def remove_task():
+    global _task_cache
+    if not IS_WIN:
+        user = os.geteuid() != 0
+        for suffix in ("path", "service"):
+            _systemctl("disable", "--now", f"{SERVICE_NAME}.{suffix}", user=user)
+            try:
+                os.remove(os.path.join(_unit_dir(user), f"{SERVICE_NAME}.{suffix}"))
+            except OSError:
+                pass
+        _systemctl("daemon-reload", user=user)
+        _task_cache = (0.0, False)
+        return {"task": False}
     subprocess.run(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"], capture_output=True,
                    creationflags=CREATE_NO_WINDOW)
     return {"task": False}
@@ -985,11 +1446,58 @@ def _progress_writer(path):
     return write
 
 
+def _apply_data_dir(argv):
+    if "--data-dir" in argv:
+        _set_app_dir(argv[argv.index("--data-dir") + 1])
+
+
+def _dir_owner():
+    """Linux, running as root on behalf of a user: remember who owns the data folder."""
+    if IS_WIN or os.geteuid() != 0:
+        return None
+    try:
+        st = os.stat(APP_DIR)
+    except OSError:
+        return None
+    return (st.st_uid, st.st_gid) if st.st_uid != 0 else None
+
+
+def _restore_ownership(owner):
+    """Files the root worker created in the user's data folder go back to the user."""
+    if not owner:
+        return
+    for dp, dns, fns in os.walk(APP_DIR):
+        for name in dns + fns:
+            try:
+                os.lchown(os.path.join(dp, name), *owner)
+            except OSError:
+                pass
+
+
 def cli(argv):
+    _apply_data_dir(argv)
+    owner = _dir_owner()
+    try:
+        return _cli(argv)
+    finally:
+        _restore_ownership(owner)
+
+
+def _cli(argv):
     pfile = argv[argv.index("--progress") + 1] if "--progress" in argv else None
     progress = _progress_writer(pfile)
     cfg = load_config()
     try:
+        if "--find" in argv:
+            found = find_resolve_binary()
+            print(found or "No Resolve binary with splash screens found")
+            return 0 if found else 1
+        if "--check" in argv:
+            print_check(cfg["exe"])
+            return 0
+        if "--diagnose" in argv:
+            diagnose(cfg["exe"])
+            return 0
         if "--restore" in argv:
             res = restore_original(cfg["exe"], progress)
         elif "--task-on" in argv:
@@ -1028,17 +1536,36 @@ def cli(argv):
 # Interface: local HTTP server + Edge app window
 # --------------------------------------------------------------------------------------
 
-class _SEI(ctypes.Structure):
-    _fields_ = [("cbSize", wt.DWORD), ("fMask", ctypes.c_ulong), ("hwnd", wt.HWND),
-                ("lpVerb", wt.LPCWSTR), ("lpFile", wt.LPCWSTR), ("lpParameters", wt.LPCWSTR),
-                ("lpDirectory", wt.LPCWSTR), ("nShow", ctypes.c_int), ("hInstApp", wt.HINSTANCE),
-                ("lpIDList", ctypes.c_void_p), ("lpClass", wt.LPCWSTR), ("hkeyClass", wt.HKEY),
-                ("dwHotKey", wt.DWORD), ("hIconOrMonitor", wt.HANDLE), ("hProcess", wt.HANDLE)]
+if IS_WIN:
+    class _SEI(ctypes.Structure):
+        _fields_ = [("cbSize", wt.DWORD), ("fMask", ctypes.c_ulong), ("hwnd", wt.HWND),
+                    ("lpVerb", wt.LPCWSTR), ("lpFile", wt.LPCWSTR), ("lpParameters", wt.LPCWSTR),
+                    ("lpDirectory", wt.LPCWSTR), ("nShow", ctypes.c_int), ("hInstApp", wt.HINSTANCE),
+                    ("lpIDList", ctypes.c_void_p), ("lpClass", wt.LPCWSTR), ("hkeyClass", wt.HKEY),
+                    ("dwHotKey", wt.DWORD), ("hIconOrMonitor", wt.HANDLE), ("hProcess", wt.HANDLE)]
+
+
+def _run_worker_posix(script, args, progress_file):
+    cmd = [sys.executable, script, *args, "--progress", progress_file, "--data-dir", APP_DIR]
+    if not needs_elevation(load_config()["exe"]):
+        return subprocess.run(cmd).returncode
+    # no bytecode: root must not leave root-owned __pycache__ folders in the user's venv
+    cmd = ["env", "PYTHONDONTWRITEBYTECODE=1", *cmd]
+    if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and shutil.which("pkexec"):
+        code = subprocess.run(["pkexec", *cmd]).returncode
+        if code in (126, 127) and not os.path.exists(progress_file):
+            raise PatchError(tr("uac_denied"))      # dialog dismissed / not authorised
+        return code
+    if shutil.which("sudo") and sys.stdin and sys.stdin.isatty():
+        return subprocess.run(["sudo", *cmd]).returncode
+    raise PatchError(tr("no_elevation", cmd="sudo " + shlex.join(cmd)))
 
 
 def run_worker(args, progress_file):
     """Runs this script with `args` (elevated via UAC if needed) and waits. Returns exit code."""
     script = os.path.abspath(__file__)
+    if not IS_WIN:
+        return _run_worker_posix(script, args, progress_file)
     full = [script, *args, "--progress", progress_file]
     if is_admin():
         return subprocess.run([_python(False), *full], creationflags=CREATE_NO_WINDOW).returncode
@@ -1060,7 +1587,20 @@ def run_worker(args, progress_file):
     return code.value
 
 
-def find_edge():
+def _is_snap(path):
+    real = os.path.realpath(path)
+    return real.startswith("/snap/") or os.path.basename(real) == "snap"
+
+
+def find_browser():
+    """Chromium-family browser for the frameless --app window (Edge on Windows)."""
+    if not IS_WIN:
+        for name in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser",
+                     "microsoft-edge-stable", "microsoft-edge", "brave-browser", "vivaldi"):
+            path = shutil.which(name)
+            if path:
+                return path
+        return None
     for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
                  os.environ.get("LOCALAPPDATA")):
         if base:
@@ -1086,7 +1626,7 @@ class App:
         self.refresh()
 
     # ---- exe state
-    def refresh(self):
+    def refresh(self, auto_search=False):
         with self.lock:
             try:
                 self.info = inspect_exe(self.cfg["exe"])
@@ -1103,6 +1643,13 @@ class App:
                 self.info, self.orig = None, {}
                 self.info_error = str(e) if os.path.isfile(self.cfg["exe"]) else \
                     tr("exe_missing")
+                if not IS_WIN and not auto_search:
+                    # wrong file or install in a non-default place: look for the binary ourselves
+                    found = find_resolve_binary()
+                    if found and found != self.cfg["exe"]:
+                        self.cfg["exe"] = found
+                        save_config(self.cfg)
+                        return self.refresh(auto_search=True)
 
     def state(self):
         info = self.info
@@ -1129,6 +1676,7 @@ class App:
             "task": task_installed(),
             "running": resolve_running(),
             "admin": is_admin(),
+            "platform": "windows" if IS_WIN else "linux",
         }
 
     def source_jpeg(self, img_id):
@@ -1146,7 +1694,10 @@ class App:
         if self.job.get("running"):
             raise PatchError(tr("busy"))
         save_config(self.cfg)
-        pfile = os.path.join(tempfile.gettempdir(), f"rsp_{uuid.uuid4().hex[:8]}.json")
+        # Linux: inside the data folder, so the root worker can write it and we can still delete it
+        pdir = tempfile.gettempdir() if IS_WIN else APP_DIR
+        os.makedirs(pdir, exist_ok=True)
+        pfile = os.path.join(pdir, f"rsp_{uuid.uuid4().hex[:8]}.json")
         self.job = {"running": True, "kind": kind, "msg": tr("waiting_admin"), "frac": 0}
 
         def worker():
@@ -1188,12 +1739,24 @@ class App:
 
 def pick_exe_dialog(initial):
     """Native file dialog (runs in its own thread with its own Tk root)."""
-    import tkinter as tk
-    from tkinter import filedialog
+    if not IS_WIN:
+        start = initial if initial and os.path.exists(initial) else "/opt/resolve/bin/"
+        for cmd in (["zenity", "--file-selection", "--title", tr("pick_exe"), "--filename", start],
+                    ["kdialog", "--title", tr("pick_exe"), "--getopenfilename", start]):
+            if shutil.which(cmd[0]):
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                out = r.stdout.strip()
+                return out if r.returncode == 0 and out else None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError:
+        raise PatchError(tr("no_dialog"))
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    p = filedialog.askopenfilename(title=tr("pick_exe"), filetypes=[("Resolve.exe", "Resolve.exe")],
+    types = [(TARGET_NAME, TARGET_NAME)] if IS_WIN else [("All files", "*")]
+    p = filedialog.askopenfilename(title=tr("pick_exe"), filetypes=types,
                                    initialdir=os.path.dirname(initial) if initial else None)
     root.destroy()
     return os.path.normpath(p) if p else None
@@ -1359,11 +1922,13 @@ def run_server(open_window=True):
 
     threading.Thread(target=watchdog, daemon=True).start()
     if open_window:
-        edge = find_edge()
+        edge = find_browser()
         if edge:
-            subprocess.Popen([edge, f"--app={url}", "--window-size=1500,980",
-                              f"--user-data-dir={os.path.join(APP_DIR, 'window')}",
-                              "--no-first-run", "--no-default-browser-check", "--disable-features=Translate"])
+            flags = [f"--app={url}", "--window-size=1500,980",
+                     "--no-first-run", "--no-default-browser-check", "--disable-features=Translate"]
+            if not (not IS_WIN and _is_snap(edge)):      # snap confinement can't use a dot-folder profile
+                flags.append(f"--user-data-dir={os.path.join(APP_DIR, 'window')}")
+            subprocess.Popen([edge, *flags], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             import webbrowser
             webbrowser.open(url)
@@ -1372,7 +1937,9 @@ def run_server(open_window=True):
 
 def main():
     argv = sys.argv[1:]
-    if any(a in argv for a in ("--apply", "--auto", "--restore", "--task-on", "--task-off")):
+    _apply_data_dir(argv)
+    if any(a in argv for a in ("--apply", "--auto", "--restore", "--task-on", "--task-off",
+                               "--check", "--find", "--diagnose")):
         sys.exit(cli(argv))
     run_server(open_window="--no-window" not in argv)
 

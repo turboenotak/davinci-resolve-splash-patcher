@@ -382,8 +382,10 @@ const I18N = {
   },
 };
 let LANG = "en";
+let PLATFORM = "windows";   // set from /api/state
 function t(key, vars = {}) {
-  const s = (I18N[LANG] && I18N[LANG][key]) ?? I18N.en[key] ?? key;
+  let s = (I18N[LANG] && I18N[LANG][key]) ?? I18N.en[key] ?? key;
+  if (PLATFORM === "linux") s = s.replaceAll("Resolve.exe", "resolve");
   return s.replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
 }
 // count phrases: "in 3 slots" / "в 3 слотах", "2 images" / "2 изображения"
@@ -760,6 +762,7 @@ function renderHeader() {
 async function reload() {
   const st = await api("state");
   S.state = st;
+  PLATFORM = st.platform || "windows";
   S.images = st.images;
   S.slotCfg = st.slotCfg || {};
   S.darken = st.darken !== false;

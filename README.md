@@ -6,7 +6,7 @@
 
 <!-- Badges -->
 
-[badge-platform]: https://img.shields.io/badge/platform-Windows-0078D4
+[badge-platform]: https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D4
 [badge-python]: https://img.shields.io/badge/python-3.10%2B-3776AB
 [badge-license]: https://img.shields.io/github/license/turboenotak/davinci-resolve-splash-patcher
 [badge-release]: https://img.shields.io/github/v/release/turboenotak/davinci-resolve-splash-patcher
@@ -38,16 +38,35 @@
 
 ---
 
-> This is an unofficial tool. It is not affiliated with or endorsed by Blackmagic Design. DaVinci Resolve is a trademark of Blackmagic Design Pty. Ltd. The patcher modifies `Resolve.exe` on your computer; use it at your own risk.
+> This is an unofficial tool. It is not affiliated with or endorsed by Blackmagic Design. DaVinci Resolve is a trademark of Blackmagic Design Pty. Ltd. The patcher modifies the `Resolve.exe` (Windows) or `resolve` (Linux) binary on your computer; use it at your own risk.
 
 ## Installation
 
 > [!IMPORTANT]
-> Windows only. You need **[Python 3.10 or newer][python-link]**. When installing Python, tick **"Add python.exe to PATH"**.
+> Windows and Linux. You need **[Python 3.10 or newer][python-link]**. On Windows, tick **"Add python.exe to PATH"** when installing Python.
+
+You can also start it the same way on both systems with `python start.py` (Windows: `py start.py`). The launcher detects the operating system, checks Python and Pillow and starts the patcher accordingly; `Start.bat` and `Start.sh` are thin wrappers around it.
+
+### Windows
 
 1. Download **[ResolveSplashPatcher.zip][download-zip]** from the [latest release][latest-release] and extract it anywhere.
 2. Double-click **`Start.bat`**. On the first run it installs [Pillow](https://pypi.org/project/pillow/), the only dependency.
 3. The interface opens in its own window. Nothing is changed until you click **Apply**.
+
+### Linux
+
+```bash
+git clone https://github.com/turboenotak/davinci-resolve-splash-patcher.git
+cd davinci-resolve-splash-patcher
+./Start.sh
+```
+
+`Start.sh` (via `start.py`) checks Python 3.10+ and, if Pillow is missing, creates a local `.venv` and installs it there (your system Python stays untouched). On Debian/Ubuntu you may need `sudo apt install python3 python3-venv`.
+
+- The interface opens as an app window in Chrome, Chromium, Edge, Brave or Vivaldi, otherwise in your default browser.
+- The patcher looks for `/opt/resolve/bin/resolve` and searches other common install folders if it is not there. Use `python3 splash_patcher.py --find` to see what it finds, or pick the file in the interface.
+- Resolve normally lives in `/opt/resolve`, which is owned by root. When you click **Apply**, root permission is requested through `pkexec` (graphical prompt) or `sudo` (terminal). The interface itself runs as your normal user.
+- `zenity` or `kdialog` (or `python3-tk`) is used for the file picker; it is only needed if you want to choose the binary by hand.
 
 Or clone the repository:
 
@@ -73,6 +92,8 @@ git clone https://github.com/turboenotak/davinci-resolve-splash-patcher.git
 
 **Restore original** puts the original bytes back from the backup at any time.
 
+On Linux, step 5 asks for root permission through a `pkexec`/`sudo` prompt instead of Windows UAC. **Re-apply after Resolve updates** installs a systemd `.path` unit that watches the Resolve binary and re-applies your images when it changes, and at boot.
+
 ## Features
 
 - Replaces both splash sets: 1110 × 490 for 100% Windows scaling and @2x 2220 × 980 for HiDPI screens
@@ -84,6 +105,7 @@ git clone https://github.com/turboenotak/davinci-resolve-splash-patcher.git
 - Automatic re-apply after Resolve updates
 - Backup and one-click restore, verified byte for byte
 - No hard-coded offsets: the resource tables are located by their signatures, so new Resolve versions work without an update
+- Works with the Windows (`Resolve.exe`) and Linux (`resolve`) builds of DaVinci Resolve
 - English and Russian interface
 
 What the patched splash screens look like (demo images, darkening on):
@@ -113,7 +135,9 @@ Replacing images by hand in a hex editor means the new PNG must be no larger tha
 
 Sixteen different images take about 9 MB in the 1x set and 31 MB in the 2x set, so nothing has to be compressed. If space ever runs out, only the heaviest images are reduced to a 256-colour palette.
 
-Before the first patch the original bytes are saved to `%APPDATA%\ResolveSplashPatcher\backups\<version>`. Re-applying always starts from that original layout.
+Before the first patch the original bytes are saved to `%APPDATA%\ResolveSplashPatcher\backups\<version>` on Windows and `~/.config/ResolveSplashPatcher/backups/<id>` on Linux. Re-applying always starts from that original layout.
+
+On Linux the `ResolveSplashScreen_Linux1` … `16` variants are the ones Resolve shows, so they receive your images too (rendered on their own template if its size differs). ELF files carry no version resource, so the backup id is derived from the file size and a hash of parts of the binary the patcher never touches.
 
 ### Command line
 
@@ -121,9 +145,13 @@ Before the first patch the original bytes are saved to `%APPDATA%\ResolveSplashP
 python splash_patcher.py --apply     # apply the saved settings
 python splash_patcher.py --auto      # apply only if Resolve is not patched yet
 python splash_patcher.py --restore   # restore the original splash screens
+python splash_patcher.py --check     # read-only: show what was found in the Resolve binary
+python splash_patcher.py --find      # Linux: locate the file that holds the splash screens
 ```
 
-Settings are stored in `%APPDATA%\ResolveSplashPatcher\config.json`, together with copies of your images (`images\`) and a log (`patcher.log`).
+On Linux use `python3` (or `./Start.sh --apply`, which also works for the other options), and run the commands with `sudo` if the binary is not writable by your user.
+
+Settings are stored in `%APPDATA%\ResolveSplashPatcher\config.json` (Windows) or `~/.config/ResolveSplashPatcher/config.json` (Linux), together with copies of your images (`images/`) and a log (`patcher.log`).
 
 ## FAQ
 
@@ -133,25 +161,33 @@ Check the status in the top bar. It should say *Splash screens replaced*. If it 
 **Resolve updated and my splash screens are gone.**
 Open the patcher and click **Apply**, or turn on **Re-apply after Resolve updates** so it happens automatically.
 
-**Does it work on macOS or Linux?**
-No. The Windows build of Resolve is the only one supported.
+**Does it work on macOS?**
+No. Windows and Linux are supported.
+
+**Linux: it says "resolve not found" or the binary has no splash screens.**
+Run `python3 splash_patcher.py --find`. If nothing is found, pick the file manually in the interface, or set `"exe"` in `~/.config/ResolveSplashPatcher/config.json`. Note that the Linux support is tested on synthetic files that mimic the Qt resource layout; if your Resolve version differs, please open an issue with the output of `--check` and `patcher.log`.
+
+**Linux: no permission prompt appears.**
+`pkexec` needs a graphical session with a polkit agent. Without one, run the command shown in the error message in a terminal with `sudo`.
 
 **Is it safe?**
 The patcher only rewrites the splash screen resources, and it backs up the original bytes first. Patching changes the file's digital signature, which does not stop Resolve from starting. If anything goes wrong, use **Restore original** or repair Resolve with its installer.
 
 **How do I uninstall it?**
-Click **Restore original**, switch off **Re-apply after Resolve updates**, then delete the folder and `%APPDATA%\ResolveSplashPatcher`.
+Click **Restore original**, switch off **Re-apply after Resolve updates**, then delete the folder and `%APPDATA%\ResolveSplashPatcher` (Windows) or `~/.config/ResolveSplashPatcher` (Linux).
 
 **Something went wrong.**
-Open an [issue][issues-link] and attach `%APPDATA%\ResolveSplashPatcher\patcher.log` and your Resolve version.
+Open an [issue][issues-link] and attach `patcher.log` (`%APPDATA%\ResolveSplashPatcher\` or `~/.config/ResolveSplashPatcher/`) and your Resolve version.
 
 ## Project structure
 
 | File | Purpose |
 |---|---|
 | `splash_patcher.py` | Resource parser, renderer, patcher, command line and the local server for the interface |
-| `ui.html` | The interface (opens in a Microsoft Edge app window) |
-| `Start.bat` | Launcher that checks Python and installs Pillow |
+| `ui.html` | The interface (opens in an Edge/Chromium app window) |
+| `start.py` | Cross-platform launcher: detects Windows or Linux, checks Python 3.10+ and Pillow, then starts the patcher (Linux: Pillow goes into a local `.venv`) |
+| `Start.bat` | Windows wrapper: finds Python and runs `start.py` |
+| `Start.sh` | Linux wrapper: finds Python and runs `start.py` |
 
 ## License
 

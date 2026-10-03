@@ -1,5 +1,5 @@
 @echo off
-rem Resolve Splash Patcher launcher: checks Python and Pillow, then opens the interface
+rem Windows launcher: finds Python and hands over to start.py (checks Pillow, starts the patcher)
 setlocal
 cd /d "%~dp0"
 
@@ -11,15 +11,4 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -c "import sys; sys.exit(sys.version_info < (3, 10))" || (
-    echo Python 3.10 or newer is required. Update it from https://www.python.org/downloads/
-    pause
-    exit /b 1
-)
-
-python -c "import PIL" 2>nul || (
-    echo Installing Pillow...
-    python -m pip install --user -r requirements.txt || (echo Failed to install Pillow & pause & exit /b 1)
-)
-
-start "" pythonw "%~dp0splash_patcher.py"
+python start.py %*
